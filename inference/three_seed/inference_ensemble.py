@@ -1,6 +1,7 @@
-"""Offline equal prediction mean of exactly three seed4486/4487/4488 models.
-FP32 single-model inference is copied unchanged from the verified single-model path.
-No parameter averaging, downloads, clipping, rounding, partial ensembles, or training.
+"""Offline FP32 inference for historical three-seed Kaggle checkpoint bundles.
+
+Average predictions from seeds 4486, 4487, and 4488 with equal weights.
+The ensemble manifest identifies the three checkpoint bundles and their metadata.
 """
 from __future__ import annotations
 import argparse
@@ -208,8 +209,9 @@ def hash_file(path):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--family", choices=("S1", "S2"), required=True)
-    parser.add_argument("--manifest", type=Path)
-    parser.add_argument("--input-root", type=Path, default=Path("/kaggle/input"))
+    parser.add_argument("--manifest", type=Path, help="Historical ensemble manifest JSON")
+    parser.add_argument("--input-root", type=Path, default=Path("/kaggle/input"),
+                        help="Directory containing the historical checkpoint bundles")
     parser.add_argument("--test", type=Path)
     parser.add_argument("--output", type=Path, default=Path("/kaggle/working/submission.csv"))
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
@@ -218,6 +220,13 @@ def main(argv=None):
     args = parser.parse_args(argv)
     require(args.batch_size > 0 and args.cpu_threads > 0, "Invalid batch size/CPU threads")
     manifest_path = args.manifest or Path(__file__).resolve().parent / f"ensemble_manifest_{args.family}.json"
+    if not manifest_path.is_file():
+        parser.error(
+            f"Ensemble manifest is missing: {manifest_path}. Supply the historical manifest "
+            "with --manifest and its checkpoint bundles under --input-root. For checkpoints "
+            "created by this repository, use python predict.py --checkpoints <checkpoint1> "
+            "<checkpoint2> <checkpoint3> --input <csv> --output <csv>."
+        )
     manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
     require(manifest.get("schema") == "ell_three_seed_prediction_ensemble_v1"
             and manifest.get("status") == "complete" and not manifest.get("pending_models"),
