@@ -14,7 +14,8 @@ from torch.nn import functional as F
 
 from data_prep import load_prepared_role
 from .model import (
-    TRAITS, _predict_tokens, collate, new_model, save_scoring_model, tokenize_rows,
+    MODEL_ID, REVISION, TRAITS, _predict_tokens, collate, new_model,
+    save_scoring_model, tokenize_rows,
 )
 
 TEACHER_SEEDS = (2006, 7, 24)
@@ -341,10 +342,80 @@ def _train(data_dir, model_path, run_dir, seed, family, *, pseudo_path, device,
               "validation_mcrmse": selected["validation_mcrmse"],
               "validation_rmse": selected["validation_rmse"], "data_manifest_sha256": manifest_digest,
               "scoring_validations": len(history), "lambda": 0.5 if pseudo else 0.0}
+    updates_per_epoch = math.ceil((len(gold) + len(pseudo)) / effective_batch)
+    top_rate = 1e-5 if teacher else 5e-6
+    result["training_config"] = {
+        "seed": seed,
+        "model_source": ({"model_id": MODEL_ID, "revision": REVISION}
+                         if str(model_path) == MODEL_ID else {"kind": "local_snapshot"}),
+        "max_length": max_length,
+        "micro_batch_size": micro_batch,
+        "effective_batch_size": effective_batch,
+        "max_epochs": epochs,
+        "completed_epochs": math.ceil(history[-1]["epoch"]),
+        "optimizer_updates_per_epoch": updates_per_epoch,
+        "optimizer_updates_completed": history[-1]["optimizer_steps"],
+        "scoring_head_dropout": model.dropout.p,
+        "encoder_hidden_dropout": model.backbone.config.hidden_dropout_prob,
+        "encoder_attention_dropout": model.backbone.config.attention_probs_dropout_prob,
+        "optimizer": {
+            "name": "AdamW",
+            "encoder_top_learning_rate": top_rate,
+            "embedding_learning_rate": top_rate / 2,
+            "score_head_learning_rate": top_rate * 10,
+            "encoder_layer_group_size": 4,
+            "layer_group_decay": 0.95,
+            "weight_decay": 0.01,
+            "zero_weight_decay_for_parameter_ndim_at_most": 1,
+            "betas": [0.9, 0.999],
+            "eps": 1e-6,
+            "foreach": False,
+            "gradient_clip_norm": 1.0,
+        },
+        "scheduler": {
+            "name": "cosine",
+            "warmup_fraction": 0.06,
+            "warmup_updates": math.ceil(epochs * updates_per_epoch * 0.06),
+            "planned_optimizer_updates": epochs * updates_per_epoch,
+        },
+        "validation": {
+            "metric": "MCRMSE",
+            "mode": "min",
+            "frequency_epochs": 0.25 if teacher else 1,
+            "batch_size": min(8, micro_batch),
+            "early_stopping_patience": None if teacher else 2,
+            "min_delta": 0.0,
+        },
+        "precision": {
+            "forward": ("bfloat16" if device.type == "cuda"
+                        and torch.cuda.is_bf16_supported() else "float32"),
+            "parameters": "float32",
+            "loss": "float32",
+            "validation": "float32",
+        },
+        "gradient_checkpointing": device.type == "cuda",
+    }
     if teacher:
         result["gold_role_sha256"] = gold_digests
         var = _calibrate(model, tokenizer, tokenize_rows(calibration, tokenizer, max_length),
                          validation, device, min(8, micro_batch))
+        result["training_config"]["variance_calibration"] = {
+            "device": "cpu",
+            "precision": "float32",
+            "max_epochs": 200,
+            "completed_epochs": len(var["history"]) - 1,
+            "optimizer": "AdamW",
+            "learning_rate": 0.001,
+            "weight_decay": 0.01,
+            "bias_weight_decay": 0.0,
+            "betas": [0.9, 0.999],
+            "eps": 1e-6,
+            "foreach": False,
+            "validation_metric": "Gaussian NLL",
+            "validation_frequency_epochs": 1,
+            "early_stopping_patience": 20,
+            "initialization_is_checkpoint_candidate": True,
+        }
         _write_json(run_dir / "variance_history.json", var.pop("history"))
         result["variance_calibration"] = var
     save_scoring_model(run_dir / "checkpoint", model.to("cpu"), tokenizer, result)
